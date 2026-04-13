@@ -1,0 +1,1055 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Petri Dish NCA - Artificial Life Laboratory</title>
+    <meta charset="utf-8">
+    <link rel="preload" href="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js" as="script">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Watch artificial lifeforms compete and evolve in this Neural Cellular Automata simulation">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-panel: #161b22;
+            --bg-control: #21262d;
+            --border-subtle: #30363d;
+            --border-glow: #58a6ff;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-red: #f85149;
+            --accent-purple: #a371f7;
+            --accent-orange: #d29922;
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body, html {
+            overflow: hidden;
+            background: var(--bg-dark);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            color: var(--text-primary);
+            height: 100%;
+        }
+
+        /* Main canvas */
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            cursor: crosshair;
+            display: block;
+        }
+
+        /* Grid border - petri dish edge */
+        #grid-border {
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            border: 1px solid var(--border-glow);
+            border-radius: 2px;
+            box-shadow: 0 0 20px rgba(88, 166, 255, 0.1);
+            pointer-events: none;
+            z-index: 5;
+            box-sizing: border-box;
+        }
+
+        /* Left panel container - SCROLLABLE */
+        #left-panel {
+            position: fixed;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            width: 300px;
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-panel);
+            border-right: 1px solid var(--border-subtle);
+            transition: transform 0.3s ease;
+            overflow: hidden;
+        }
+
+        #left-panel.hidden {
+            transform: translateX(-100%);
+        }
+
+        /* Title section - fixed at top */
+        #title-section {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-subtle);
+            flex-shrink: 0;
+        }
+
+        #title-section h1 {
+            font-size: 15px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            color: var(--accent-blue);
+        }
+
+        #title-section p {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        /* Scrollable content area */
+        #panel-content {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding-bottom: 20px;
+        }
+
+        /* Custom scrollbar */
+        #panel-content::-webkit-scrollbar {
+            width: 6px;
+        }
+        #panel-content::-webkit-scrollbar-track {
+            background: var(--bg-dark);
+        }
+        #panel-content::-webkit-scrollbar-thumb {
+            background: var(--border-subtle);
+            border-radius: 3px;
+        }
+        #panel-content::-webkit-scrollbar-thumb:hover {
+            background: var(--text-muted);
+        }
+
+        /* Quick start - collapsible */
+        #quick-start {
+            margin: 12px;
+            padding: 12px 14px;
+            background: var(--bg-control);
+            border-radius: 8px;
+            border: 1px solid var(--border-subtle);
+            font-size: 11px;
+        }
+
+        #quick-start.collapsed {
+            padding: 8px 14px;
+        }
+
+        #quick-start-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        #quick-start-header h3 {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        #quick-start-toggle {
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        #quick-start-content {
+            margin-top: 10px;
+        }
+
+        #quick-start.collapsed #quick-start-content {
+            display: none;
+        }
+
+        #quick-start ul {
+            padding-left: 16px;
+            color: var(--text-secondary);
+            line-height: 1.7;
+        }
+
+        #quick-start li {
+            margin-bottom: 2px;
+        }
+
+        /* Show/Hide panel button */
+        #toggle-panel-btn {
+            position: fixed;
+            top: 16px;
+            left: 16px;
+            z-index: 101;
+            padding: 10px 16px;
+            background: var(--bg-panel);
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: none;
+        }
+
+        #toggle-panel-btn:hover {
+            background: var(--bg-control);
+            border-color: var(--accent-blue);
+        }
+
+        #left-panel.hidden ~ #toggle-panel-btn {
+            display: block;
+        }
+
+        /* dat.GUI overrides for modern look */
+        .dg.main {
+            font-family: 'Inter', sans-serif !important;
+        }
+
+        .dg.main .close-button {
+            display: none !important;
+        }
+
+        .dg {
+            font-size: 11px !important;
+        }
+
+        .dg .cr {
+            border-left: 3px solid transparent !important;
+            background: var(--bg-control) !important;
+        }
+
+        .dg .cr:hover {
+            background: #282e36 !important;
+        }
+
+        .dg .cr.function {
+            border-left-color: transparent !important;
+        }
+
+        .dg .property-name {
+            color: var(--text-secondary) !important;
+            font-weight: 400 !important;
+        }
+
+        .dg .c input[type=text] {
+            background: var(--bg-dark) !important;
+            border: 1px solid var(--border-subtle) !important;
+            color: var(--text-primary) !important;
+            border-radius: 4px !important;
+        }
+
+        .dg .c select {
+            background: var(--bg-dark) !important;
+            border: 1px solid var(--border-subtle) !important;
+            color: var(--text-primary) !important;
+            border-radius: 4px !important;
+        }
+
+        .dg .slider {
+            background: var(--bg-dark) !important;
+            border-radius: 4px !important;
+        }
+
+        .dg .slider-fg {
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple)) !important;
+            border-radius: 4px !important;
+        }
+
+        /* Fine-grained up/down arrows injected next to numeric inputs */
+        .dg .step-arrows {
+            display: inline-flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 1px;
+            margin-left: 3px;
+            vertical-align: middle;
+            pointer-events: auto;
+        }
+        .dg .step-arrow {
+            appearance: none;
+            -webkit-appearance: none;
+            background: var(--bg-dark);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-secondary);
+            border-radius: 2px;
+            width: 14px;
+            height: 9px;
+            line-height: 7px;
+            font-size: 7px;
+            padding: 0;
+            margin: 0;
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .dg .step-arrow:hover {
+            background: var(--accent-blue);
+            color: #fff;
+            border-color: var(--accent-blue);
+        }
+        .dg .step-arrow:active {
+            transform: scale(0.92);
+        }
+
+        .dg li.title {
+            background: var(--bg-panel) !important;
+            color: var(--text-primary) !important;
+            font-weight: 500 !important;
+            border-bottom: 1px solid var(--border-subtle) !important;
+            padding: 10px 12px 10px 28px !important;
+            line-height: 1.3 !important;
+            cursor: pointer !important;
+            position: relative !important;
+        }
+
+        /* Triangle indicator for folder open/close state */
+        .dg li.title::before {
+            content: '▾';
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 10px;
+            color: var(--text-secondary);
+            transition: transform 0.15s ease;
+        }
+        .dg ul.closed > li.title::before,
+        .dg li.folder > ul.closed ~ li.title::before {
+            transform: translateY(-50%) rotate(-90deg);
+        }
+        /* When the folder's inner ul is closed, rotate its title's arrow.
+           The title is INSIDE the closed ul, so target it directly: */
+        .dg ul.closed > li.title::before {
+            content: '▸';
+            transform: translateY(-50%);
+        }
+
+        /* Folder collapse: hide all non-title children when closed.
+           dat.GUI puts the title inside the same UL as the controls,
+           so we must keep the title visible while hiding the rest.
+           We also need to hide non-li children (like color preview divs). */
+        .dg ul.closed > *:not(.title) {
+            display: none !important;
+            height: 0 !important;
+        }
+
+        /* Control rows - single line with ellipsis truncation */
+        .dg .cr {
+            line-height: 27px !important;
+            height: 27px !important;
+        }
+
+        .dg .cr .property-name {
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        .dg .cr.function {
+            border-radius: 6px !important;
+            margin: 4px 8px !important;
+            transition: all 0.15s ease;
+            border-left: none !important;
+            overflow: visible !important;
+            height: auto !important;
+            min-height: 32px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+
+        .dg .cr.function .property-name {
+            text-align: center !important;
+            width: 100% !important;
+            font-weight: 500 !important;
+            font-size: 12px !important;
+            color: white !important;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3) !important;
+            letter-spacing: 0.3px !important;
+            padding: 8px 12px !important;
+            line-height: 1 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+
+        .dg .cr.function:hover {
+            filter: brightness(1.15);
+            transform: translateY(-1px);
+        }
+
+        /* Specific button colors */
+        .dg .cr.function.btn-start {
+            background: #22c55e !important;
+        }
+        .dg .cr.function.btn-pause {
+            background: #f59e0b !important;
+        }
+        .dg .cr.function.btn-reset {
+            background: #ef4444 !important;
+        }
+        .dg .cr.function.btn-showcase {
+            background: #6366f1 !important;
+            transition: all 0.4s ease;
+        }
+        .dg .cr.function.btn-showcase-glow {
+            position: relative;
+            z-index: 1;
+            background: linear-gradient(90deg, #03a9f4, #f441a5, #ffeb3b, #03a9f4) !important;
+            background-size: 400% !important;
+            animation: showcase-scroll 8s linear infinite;
+        }
+        .dg .cr.function.btn-showcase-glow::before {
+            content: '';
+            position: absolute;
+            top: -5px;
+            right: -5px;
+            bottom: -5px;
+            left: -5px;
+            z-index: -1;
+            background: linear-gradient(90deg, #03a9f4, #f441a5, #ffeb3b, #03a9f4);
+            background-size: 400%;
+            border-radius: 4px;
+            filter: blur(20px);
+            opacity: 1;
+            animation: showcase-scroll 8s linear infinite;
+        }
+        /* Larger, bolder text while glowing */
+        .dg .cr.function.btn-showcase-glow .property-name {
+            font-size: 14px !important;
+            font-weight: 900 !important;
+            text-transform: uppercase !important;
+            letter-spacing: 1.5px !important;
+            color: #fff !important;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+        }
+        @keyframes showcase-scroll {
+            0%   { background-position: 0%; }
+            100% { background-position: 400%; }
+        }
+        .dg .cr.function.btn-export {
+            background: #8b5cf6 !important;
+        }
+        .dg .cr.function.btn-tool {
+            background: #3b82f6 !important;
+        }
+        .dg .cr.function.btn-reseed {
+            background: #06b6d4 !important;
+        }
+
+        .dg .cr.boolean {
+            border-left-color: var(--accent-green) !important;
+        }
+
+        .dg .cr.number {
+            border-left-color: var(--accent-blue) !important;
+        }
+
+        .dg .cr.key-param {
+            position: relative;
+            border-left: 3px solid #e8a735 !important;
+            background: linear-gradient(90deg,
+                rgba(232, 167, 53, 0.12) 0%,
+                rgba(232, 167, 53, 0.04) 35%,
+                transparent 70%
+            ) !important;
+            box-shadow:
+                inset 0 1px 0 rgba(232, 167, 53, 0.08),
+                inset 0 -1px 0 rgba(232, 167, 53, 0.08);
+        }
+        .dg .cr.key-param .property-name {
+            color: #f0d890 !important;
+            font-weight: 600 !important;
+        }
+
+        .dg .cr.string {
+            border-left-color: var(--accent-purple) !important;
+        }
+
+        /* NCA button grid */
+        .nca-grid-container {
+            display: grid;
+            gap: 5px;
+            padding: 8px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .nca-grid-button {
+            border: 2px solid rgba(255, 255, 255, 0.15);
+            border-radius: 6px;
+            color: white;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+            font-size: 11px;
+            font-weight: 600;
+            min-width: 0;
+            font-weight: 600;
+            padding: 8px 4px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .nca-grid-button:hover {
+            border-color: rgba(255, 255, 255, 0.4);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        .nca-grid-button.selected-tool {
+            border: 2px solid #fff;
+            box-shadow: 0 0 8px var(--species-glow), 0 0 20px var(--species-glow), 0 0 40px var(--species-glow-dim);
+        }
+        .dg .cr.function.active-tool {
+            border: 1px solid #0ff !important;
+            box-shadow: 0 0 8px #0ff, 0 0 20px #0ff, 0 0 40px rgba(0,255,255,0.3), inset 0 0 10px rgba(0,255,255,0.2);
+        }
+
+        /* Tooltip styles */
+        .tooltip-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 11px;
+            height: 11px;
+            margin-right: 4px;
+            background: var(--border-subtle);
+            border-radius: 50%;
+            font-size: 8px;
+            font-weight: 600;
+            color: var(--text-muted);
+            cursor: pointer;
+            flex-shrink: 0;
+            vertical-align: middle;
+        }
+
+        .tooltip-icon:hover {
+            background: var(--accent-blue);
+            color: white;
+        }
+
+        .tooltip-icon .tooltip-text {
+            visibility: hidden;
+            opacity: 0;
+            position: fixed;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 400;
+            line-height: 1.4;
+            width: 220px;
+            white-space: normal;
+            z-index: 10000;
+            border: 1px solid var(--accent-blue);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            transition: opacity 0.15s ease;
+            pointer-events: none;
+        }
+
+        .tooltip-icon:hover .tooltip-text {
+            visibility: visible;
+            opacity: 1;
+        }
+
+        /* Loading spinner */
+        #loading-spinner-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 9999;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.3);
+            pointer-events: none;
+        }
+
+        .spinner {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: 3px solid rgba(88, 166, 255, 0.2);
+            border-top: 3px solid var(--accent-blue);
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* ============================================= */
+        /* TIMELINE DASHBOARD                            */
+        /* ============================================= */
+
+        #timeline-container {
+            position: fixed;
+            top: 0;
+            left: 300px;
+            right: 0;
+            height: 108px;
+            background: #0a0a0a;
+            border-bottom: 1px solid var(--border-subtle);
+            z-index: 100;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+            transition: height 0.2s ease-out, left 0.2s ease;
+        }
+
+        #timeline-container.collapsed {
+            height: 4px;
+            cursor: pointer;
+        }
+
+        #timeline-container.collapsed ~ #checkpoint-tray {
+            top: 4px;
+        }
+
+        #timeline-container.collapsed ~ #checkpoint-tray ~ #c {
+            top: 56px;
+            height: calc(100vh - 56px);
+        }
+
+        body.panel-hidden #timeline-container {
+            left: 0;
+        }
+
+        #timeline-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        #timeline-tooltip {
+            position: absolute;
+            background: rgba(14, 14, 14, 0.96);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-secondary);
+            pointer-events: none;
+            z-index: 110;
+            backdrop-filter: blur(8px);
+            white-space: nowrap;
+        }
+
+        /* ============================================= */
+        /* CHECKPOINT TRAY                               */
+        /* ============================================= */
+
+        #checkpoint-tray {
+            position: fixed;
+            top: 108px;
+            left: 300px;
+            right: 0;
+            height: 52px;
+            background: rgba(10, 10, 10, 0.9);
+            border-bottom: 1px solid var(--border-subtle);
+            z-index: 99;
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            gap: 8px;
+            transition: left 0.2s ease;
+        }
+
+        body.panel-hidden #checkpoint-tray {
+            left: 0;
+        }
+
+        #checkpoint-slots {
+            display: flex;
+            gap: 6px;
+            flex: 1;
+        }
+
+        .checkpoint-slot {
+            width: 40px;
+            height: 40px;
+            border-radius: 4px;
+            border: 1px dashed rgba(255,255,255,0.15);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+            transition: border-color 0.2s, transform 0.15s;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        .checkpoint-slot.filled {
+            border: 1px solid #b8a56a;
+            border-style: solid;
+        }
+
+        .checkpoint-slot.filled:hover {
+            border-color: #d4c078;
+            transform: scale(1.1);
+            box-shadow: 0 0 8px rgba(184, 165, 106, 0.3);
+        }
+
+        .checkpoint-slot img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .checkpoint-slot .cp-step {
+            position: absolute;
+            bottom: 1px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            font-size: 8px;
+            color: #fff;
+            background: rgba(0,0,0,0.7);
+            padding: 1px 0;
+        }
+
+        #save-checkpoint-btn {
+            background: rgba(184, 165, 106, 0.15);
+            border: 1px solid #b8a56a;
+            color: #b8a56a;
+            padding: 6px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+            font-size: 12px;
+            font-weight: 500;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+
+        #save-checkpoint-btn:hover {
+            background: rgba(184, 165, 106, 0.3);
+        }
+
+        .cp-icon {
+            font-size: 10px;
+        }
+
+        /* ============================================= */
+        /* REPLAY CONTROLS                               */
+        /* ============================================= */
+
+        #replay-controls {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(14, 14, 14, 0.95);
+            border: 1px solid #b8a56a;
+            border-radius: 8px;
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            z-index: 200;
+            backdrop-filter: blur(12px);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        }
+
+        #replay-controls button {
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
+            color: var(--text-primary);
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s;
+        }
+
+        #replay-controls button:hover {
+            background: rgba(255,255,255,0.12);
+        }
+
+        .takeover-btn {
+            width: auto !important;
+            padding: 0 16px !important;
+            background: rgba(184, 165, 106, 0.2) !important;
+            border-color: #b8a56a !important;
+            color: #b8a56a !important;
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            font-size: 11px !important;
+            letter-spacing: 0.05em;
+        }
+
+        .takeover-btn:hover {
+            background: rgba(184, 165, 106, 0.4) !important;
+        }
+
+        #replay-speed {
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
+            color: var(--text-primary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+        }
+
+        #replay-step-display {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-left: 8px;
+        }
+
+        /* ============================================= */
+        /* CHECKPOINT POPOVER                            */
+        /* ============================================= */
+
+        .checkpoint-popover {
+            position: absolute;
+            background: rgba(14, 14, 14, 0.97);
+            border: 1px solid #b8a56a;
+            border-radius: 6px;
+            padding: 12px;
+            z-index: 300;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+            min-width: 180px;
+        }
+
+        .checkpoint-popover img {
+            width: 96px;
+            height: 96px;
+            border-radius: 4px;
+            image-rendering: pixelated;
+            border: 1px solid rgba(255,255,255,0.1);
+            object-fit: cover;
+        }
+
+        .checkpoint-popover .cp-name {
+            font-family: 'Inter', sans-serif;
+            font-size: 13px;
+            color: var(--text-primary);
+            margin: 8px 0 4px;
+        }
+
+        .checkpoint-popover .cp-info {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .checkpoint-popover .cp-actions {
+            display: flex;
+            gap: 6px;
+        }
+
+        .checkpoint-popover button {
+            flex: 1;
+            padding: 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.06);
+            color: var(--text-primary);
+            font-family: 'Inter', sans-serif;
+            font-size: 11px;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .checkpoint-popover button:hover {
+            background: rgba(255,255,255,0.12);
+        }
+
+        .checkpoint-popover button.export-btn {
+            background: rgba(88, 166, 255, 0.1);
+            border-color: var(--accent-blue);
+            color: var(--accent-blue);
+        }
+
+        .checkpoint-popover button.resume-btn {
+            background: rgba(59, 185, 80, 0.15);
+            border-color: var(--accent-green);
+            color: var(--accent-green);
+        }
+
+        .checkpoint-popover button.delete-btn {
+            background: rgba(248, 81, 73, 0.1);
+            border-color: transparent;
+            color: var(--accent-red);
+        }
+
+        /* Adjust canvas position for timeline + checkpoint tray */
+        #c {
+            position: fixed;
+            top: 160px; /* 108px timeline + 52px checkpoint tray */
+            left: 300px;
+            width: calc(100vw - 300px);
+            height: calc(100vh - 160px);
+        }
+
+        body.panel-hidden #c {
+            left: 0;
+            width: 100vw;
+        }
+
+        /* Recording indicator */
+        .rec-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 0.15em;
+        }
+
+        .rec-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #ff3b30;
+            animation: rec-pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes rec-pulse {
+            0%, 100% { opacity: 0.7; }
+            50% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <!-- Boot overlay — renders instantly before any JS loads -->
+    <div id="boot-overlay" style="
+        position:fixed; inset:0; z-index:99999;
+        background:#050505;
+        display:flex; flex-direction:column;
+        align-items:center; justify-content:center;
+        transition: opacity 0.5s ease;
+    ">
+        <div style="
+            width:44px; height:44px;
+            border:3px solid #333; border-top-color:#7af;
+            border-radius:50%;
+            animation: boot-spin 0.8s linear infinite;
+            margin-bottom:20px;
+        "></div>
+        <p id="boot-status" style="
+            color:#888; font-family:'Inter',sans-serif;
+            font-size:14px; margin:0; letter-spacing:0.3px;
+        ">Loading simulation engine...</p>
+    </div>
+    <style>@keyframes boot-spin { to { transform: rotate(360deg); } }</style>
+
+    <!-- Grid border (petri dish edge) -->
+    <div id="grid-border"></div>
+
+    <!-- Left panel -->
+    <div id="left-panel">
+        <div id="title-section">
+            <h1>PETRI DISH NCA</h1>
+            <p>Artificial Life Laboratory</p>
+        </div>
+
+        <div id="panel-content">
+            <div id="quick-start">
+                <div id="quick-start-header" onclick="toggleQuickStart()">
+                    <h3>Quick Start</h3>
+                    <span id="quick-start-toggle">[hide]</span>
+                </div>
+                <div id="quick-start-content">
+                    <ul>
+                        <li>Press <strong>Start</strong> to begin</li>
+                        <li>Species compete via attack/defense</li>
+                        <li>Draw walls to block growth</li>
+                        <li>Press <strong>H</strong> to hide panel</li>
+                    </ul>
+                </div>
+            </div>
+            <!-- dat.GUI will be inserted here -->
+            <div id="gui-container"></div>
+        </div>
+    </div>
+
+
+    <!-- Show panel button -->
+    <button id="toggle-panel-btn" onclick="togglePanel()">Show Panel [H]</button>
+
+    <!-- Timeline Dashboard -->
+    <div id="timeline-container">
+        <canvas id="timeline-canvas"></canvas>
+        <div id="timeline-tooltip" style="display:none;"></div>
+    </div>
+
+    <!-- Checkpoint Tray -->
+    <div id="checkpoint-tray">
+        <div id="checkpoint-slots"></div>
+        <button id="save-checkpoint-btn" title="Save Checkpoint (S)">
+            <span class="cp-icon">&#9670;</span> Save
+        </button>
+    </div>
+
+    <!-- Replay Transport Controls -->
+    <div id="replay-controls" style="display:none;">
+        <button id="replay-prev" title="Previous checkpoint">&#9198;</button>
+        <button id="replay-back" title="Step back">&#9664;&#9664;</button>
+        <button id="replay-playpause" title="Play/Pause">&#9654;</button>
+        <button id="replay-forward" title="Step forward">&#9654;&#9654;</button>
+        <button id="replay-next" title="Next checkpoint">&#9197;</button>
+        <select id="replay-speed">
+            <option value="1">1x</option>
+            <option value="2">2x</option>
+            <option value="10">10x</option>
+        </select>
+        <button id="replay-takeover" class="takeover-btn">TAKE OVER</button>
+        <span id="replay-step-display">Step 0 / 0</span>
+    </div>
+
+    <!-- Main canvas -->
+    <canvas id="c"></canvas>
+
+    <!-- Scripts -->
+    <script src="swissgl.js"></script>
+    <script src="dat.gui.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+    <script src="timeline-store.js" defer></script>
+    <script src="petri-dish.js" defer></script>
+    <script src="timeline.js" defer></script>
+    <script src="recording.js" defer></script>
+    <script src="main.js" defer></script>
+
+    <script>
+        function toggleQuickStart() {
+            const qs = document.getElementById('quick-start');
+            const toggle = document.getElementById('quick-start-toggle');
+            qs.classList.toggle('collapsed');
+            toggle.textContent = qs.classList.contains('collapsed') ? '[show]' : '[hide]';
+        }
+
+        function togglePanel() {
+            const panel = document.getElementById('left-panel');
+            panel.classList.toggle('hidden');
+            document.body.classList.toggle('panel-hidden', panel.classList.contains('hidden'));
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'h' || e.key === 'H') {
+                if (e.target.tagName === 'INPUT') return;
+                togglePanel();
+            }
+        });
+    </script>
+</body>
+</html>
