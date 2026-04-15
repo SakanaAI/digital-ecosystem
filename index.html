@@ -48,6 +48,45 @@
             display: block;
         }
 
+        /* Experimental Sun-mode rows — red tint to signal experimental status */
+        .sun-tinted-row,
+        .sun-tinted-row > .cr,
+        .sun-tinted-row .property-name {
+            background: linear-gradient(90deg, rgba(180, 30, 40, 0.22), rgba(180, 30, 40, 0.10)) !important;
+        }
+        .sun-tinted-row {
+            border-left: 2px solid rgba(255, 80, 80, 0.55) !important;
+        }
+
+        /* Red EXPERIMENTAL variant of the tooltip icon */
+        .tooltip-icon.sun-warn-badge {
+            background: rgba(200, 40, 50, 0.85);
+            color: #fff;
+            margin-left: 4px;
+            margin-right: 0;
+        }
+        .tooltip-icon.sun-warn-badge:hover {
+            background: #ff3040;
+            color: #fff;
+        }
+        .tooltip-icon.sun-warn-badge .tooltip-text {
+            border-color: #ff3040;
+        }
+
+        /* Sun divergence overlay — blended over the simulation on hover */
+        #sun-overlay-canvas {
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            image-rendering: pixelated;
+            mix-blend-mode: screen;
+            opacity: 0.75;
+            z-index: 6;
+            display: none;
+        }
+
         /* Grid border - petri dish edge */
         #grid-border {
             position: fixed;
@@ -955,6 +994,9 @@
 
     <!-- Grid border (petri dish edge) -->
     <div id="grid-border"></div>
+
+    <!-- Sun divergence overlay (shown on heatmap hover) -->
+    <canvas id="sun-overlay-canvas"></canvas>
 
     <!-- Left panel -->
     <div id="left-panel">
