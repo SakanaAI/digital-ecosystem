@@ -32,6 +32,8 @@ const simState = {
     model: null,
     sun_base: null,
     sun_params: null,
+    inr: null,              // Seasonal INR params (null when SUN_MODE !== 'seasonal')
+    inr_coords: null,       // Normalized (x,y) coordinate cache for the INR
     optimizer: null,
     grid: null,
     wallGrid: null,
@@ -750,19 +752,47 @@ function setupGUI() {
 
     // Diagnostic / oscillation knobs (top of Advanced)
     advancedFolder.add(GUI_STATE, 'SUN_LR_SCALE', 0, 10).step(0.001).name('Sun LR Scale');
-    const localSunController = advancedFolder.add(GUI_STATE, 'USE_LOCAL_SUN').name('Local Sun')
-        .onChange(val => {
-            toggleLocalSun(val);
-            updateSunHeatmapVisibility(val);
-            if (val) updateSunHeatmap();
+    const localSunController = advancedFolder.add(GUI_STATE, 'SUN_MODE', ['global', 'spatial', 'seasonal']).name('Sun Mode')
+        .onChange(newMode => {
+            setSunMode(newMode);
+            const isLocal = newMode !== 'global';
+            updateSunHeatmapVisibility(isLocal);
+            updateSeasonalPanelVisibility(newMode === 'seasonal');
+            if (isLocal) updateSunHeatmap();
+            if (newMode === 'seasonal') updateSeasonalPanel();
         });
+    // Red tint + EXPERIMENTAL warning on the Sun Mode row
+    {
+        const sunModeLi = localSunController.domElement.parentElement.parentElement;
+        sunModeLi.id = 'sun-mode-li';
+        sunModeLi.classList.add('sun-tinted-row');
+        const propertyRow = localSunController.domElement.closest('.cr') || sunModeLi;
+        const nameCell = propertyRow.querySelector('.property-name');
+        if (nameCell && !nameCell.querySelector('.sun-warn-badge')) {
+            const warnText = 'EXPERIMENTAL: spatial/seasonal sun modes are untested research features and may destabilise the simulation or fail to converge.';
+            const warn = document.createElement('span');
+            warn.className = 'tooltip-icon sun-warn-badge';
+            warn.textContent = '!';
+            const warnTextEl = document.createElement('span');
+            warnTextEl.className = 'tooltip-text';
+            warnTextEl.textContent = warnText;
+            warn.appendChild(warnTextEl);
+            warn.addEventListener('mouseenter', () => {
+                const rowRect = propertyRow.getBoundingClientRect();
+                warnTextEl.style.bottom = `${window.innerHeight - rowRect.top + 8}px`;
+                warnTextEl.style.left = `${rowRect.left + 10}px`;
+            });
+            nameCell.appendChild(warn);
+        }
+    }
 
     // --- Sun divergence heatmap (visible only when Local Sun is on) ---
     {
         const heatmapLi = document.createElement('li');
         heatmapLi.style.cssText = 'padding:4px 8px; background:transparent; height:auto; overflow:visible; border:none;';
         heatmapLi.id = 'sun-heatmap-li';
-        heatmapLi.style.display = GUI_STATE.USE_LOCAL_SUN ? 'block' : 'none';
+        heatmapLi.classList.add('sun-tinted-row');
+        heatmapLi.style.display = (GUI_STATE.SUN_MODE !== 'global') ? 'block' : 'none';
 
         const label = document.createElement('div');
         label.style.cssText = 'font-size:10px; color:#888; margin-bottom:3px; font-family:"JetBrains Mono",monospace;';
@@ -771,7 +801,9 @@ function setupGUI() {
 
         const heatmapCanvas = document.createElement('canvas');
         heatmapCanvas.id = 'sun-heatmap-canvas';
-        heatmapCanvas.style.cssText = 'width:100%; image-rendering:pixelated; border:1px solid #333; border-radius:3px; display:block;';
+        heatmapCanvas.style.cssText = 'width:100%; image-rendering:pixelated; border:1px solid #333; border-radius:3px; display:block; cursor:crosshair;';
+        heatmapCanvas.addEventListener('mouseenter', showSunOverlay);
+        heatmapCanvas.addEventListener('mouseleave', hideSunOverlay);
         heatmapLi.appendChild(heatmapCanvas);
 
         // Stats line under the heatmap
@@ -788,6 +820,117 @@ function setupGUI() {
             innerUl.insertBefore(heatmapLi, localSunLi.nextSibling);
         } else {
             innerUl.appendChild(heatmapLi);
+        }
+    }
+
+    // --- Heatmap refresh rate slider (visible only with heatmap) ---
+    const heatmapRateCtrl = advancedFolder.add(GUI_STATE, 'HEATMAP_UPDATE_EVERY', 1, 200).step(1).name('Heatmap Every');
+    {
+        const rowLi = heatmapRateCtrl.domElement.parentElement.parentElement;
+        rowLi.id = 'sun-heatmap-rate-li';
+        rowLi.classList.add('sun-tinted-row');
+        const heatmapLi = document.getElementById('sun-heatmap-li');
+        const innerUl = advancedFolder.domElement.querySelector('ul');
+        if (heatmapLi && heatmapLi.nextSibling) {
+            innerUl.insertBefore(rowLi, heatmapLi.nextSibling);
+        } else if (heatmapLi) {
+            innerUl.appendChild(rowLi);
+        }
+        rowLi.style.display = GUI_STATE.SUN_MODE !== 'global' ? 'block' : 'none';
+    }
+
+    // --- Overlay blend options (visible only with heatmap) ---
+    {
+        const blendLi = document.createElement('li');
+        blendLi.id = 'sun-overlay-blend-li';
+        blendLi.classList.add('sun-tinted-row');
+        blendLi.style.cssText = 'padding:6px 8px; background:transparent; height:auto; overflow:visible; border:none; display:' + (GUI_STATE.SUN_MODE !== 'global' ? 'block' : 'none') + ';';
+
+        const label = document.createElement('div');
+        label.style.cssText = 'font-size:10px; color:#888; margin-bottom:3px; font-family:"JetBrains Mono",monospace;';
+        label.textContent = 'Overlay blend (on hover)';
+        blendLi.appendChild(label);
+
+        const modeRow = document.createElement('div');
+        modeRow.style.cssText = 'display:flex; align-items:center; gap:6px; margin-bottom:4px;';
+        const modeLabel = document.createElement('span');
+        modeLabel.style.cssText = 'font-size:10px; color:#aaa; width:52px; font-family:"JetBrains Mono",monospace;';
+        modeLabel.textContent = 'mode';
+        const modeSel = document.createElement('select');
+        modeSel.id = 'sun-overlay-blend-mode';
+        modeSel.style.cssText = 'flex:1; font-size:10px; background:#111; color:#ddd; border:1px solid #333; border-radius:2px; padding:2px 4px; font-family:"JetBrains Mono",monospace;';
+        ['screen', 'normal', 'multiply', 'overlay', 'hard-light', 'soft-light', 'lighten', 'difference'].forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m; opt.textContent = m;
+            if (m === 'screen') opt.selected = true;
+            modeSel.appendChild(opt);
+        });
+        modeSel.addEventListener('change', () => {
+            const ov = document.getElementById('sun-overlay-canvas');
+            if (ov) ov.style.mixBlendMode = modeSel.value;
+        });
+        modeRow.appendChild(modeLabel);
+        modeRow.appendChild(modeSel);
+        blendLi.appendChild(modeRow);
+
+        const opRow = document.createElement('div');
+        opRow.style.cssText = 'display:flex; align-items:center; gap:6px;';
+        const opLabel = document.createElement('span');
+        opLabel.style.cssText = 'font-size:10px; color:#aaa; width:52px; font-family:"JetBrains Mono",monospace;';
+        opLabel.textContent = 'opacity';
+        const opInput = document.createElement('input');
+        opInput.type = 'range'; opInput.min = '0'; opInput.max = '1'; opInput.step = '0.01'; opInput.value = '0.75';
+        opInput.id = 'sun-overlay-blend-opacity';
+        opInput.style.cssText = 'flex:1;';
+        const opVal = document.createElement('span');
+        opVal.style.cssText = 'font-size:10px; color:#ccc; width:34px; text-align:right; font-family:"JetBrains Mono",monospace;';
+        opVal.textContent = '0.75';
+        opInput.addEventListener('input', () => {
+            const ov = document.getElementById('sun-overlay-canvas');
+            if (ov) ov.style.opacity = opInput.value;
+            opVal.textContent = parseFloat(opInput.value).toFixed(2);
+        });
+        opRow.appendChild(opLabel);
+        opRow.appendChild(opInput);
+        opRow.appendChild(opVal);
+        blendLi.appendChild(opRow);
+
+        const innerUl = advancedFolder.domElement.querySelector('ul');
+        const rateLi = document.getElementById('sun-heatmap-rate-li');
+        if (rateLi && rateLi.nextSibling) {
+            innerUl.insertBefore(blendLi, rateLi.nextSibling);
+        } else if (rateLi) {
+            innerUl.appendChild(blendLi);
+        }
+    }
+
+    // --- Seasonal period read-out (visible only when Sun Mode == seasonal) ---
+    {
+        const seasonLi = document.createElement('li');
+        seasonLi.id = 'sun-seasonal-li';
+        seasonLi.style.cssText = 'padding:4px 8px; background:transparent; height:auto; overflow:visible; border:none;';
+        seasonLi.classList.add('sun-tinted-row');
+        seasonLi.style.display = (GUI_STATE.SUN_MODE === 'seasonal') ? 'block' : 'none';
+
+        const label = document.createElement('div');
+        label.style.cssText = 'font-size:10px; color:#888; margin-bottom:3px; font-family:"JetBrains Mono",monospace;';
+        label.textContent = 'Learned seasonal periods (sim steps)';
+        seasonLi.appendChild(label);
+
+        const list = document.createElement('pre');
+        list.id = 'sun-seasonal-periods';
+        list.style.cssText = 'font-size:10px; color:#ccc; margin:0; padding:6px 8px; background:#0a0a0a; border:1px solid #333; border-radius:3px; font-family:"JetBrains Mono",monospace; line-height:1.3;';
+        list.textContent = '—';
+        seasonLi.appendChild(list);
+
+        const innerUl = advancedFolder.domElement.querySelector('ul');
+        const anchor = document.getElementById('sun-overlay-blend-li')
+            || document.getElementById('sun-heatmap-li')
+            || localSunController.domElement.parentElement.parentElement;
+        if (anchor.nextSibling) {
+            innerUl.insertBefore(seasonLi, anchor.nextSibling);
+        } else {
+            innerUl.appendChild(seasonLi);
         }
     }
 
@@ -930,7 +1073,7 @@ function hookGUIForEventLog() {
         'DIVERSITY_WEIGHT', 'SUN_PENALTY', 'MIN_OCCUPANCY', 'STOCHASTIC_UPDATE_PROB',
         'USE_LOCAL_WIN_RATE', 'LOCAL_WIN_RATE_ALPHA', 'LOCAL_WIN_RATE_STRENGTH',
         'COMPETITION_MODE', 'MODEL_DROPOUT_P', 'OPTIMIZER_TYPE', 'USE_COSINE_SIM',
-        'USE_CONCENTRATION', 'USE_LOCAL_SUN', 'CONCENTRATION_TEMP', 'CONC_BASELINE', 'CONCENTRATION_WINDOW',
+        'USE_CONCENTRATION', 'SUN_MODE', 'CONCENTRATION_TEMP', 'CONC_BASELINE', 'CONCENTRATION_WINDOW',
         'OPTIMIZATION_PERCENT', 'ASINH_SLOPE', 'SOFT_MIN_K', 'SUN_INIT_SCALE',
         'N_NCAS', 'CELL_STATE_DIM', 'CELL_HIDDEN_DIM', 'HIDDEN_DIM',
         'N_HIDDEN_LAYERS', 'KERNEL_SIZE', 'GRID_W', 'GRID_H', 'N_SEEDS',
@@ -1350,9 +1493,13 @@ async function initializeSimulation(keepState = false, oldGrid, oldWallGrid, old
         runManager.metrics.speciesCount = GUI_STATE.N_NCAS;
     }
 
-    // Dispose old tensors
+    // Dispose old tensors. INR weights are grid-size-invariant so we keep them
+    // across keepState resizes; only the coords cache (which IS grid-sized)
+    // is always rebuilt below.
     if (simState.sun_base) simState.sun_base.dispose();
     if (simState.sun_params) simState.sun_params.dispose();
+    if (simState.inr_coords) { simState.inr_coords.dispose(); simState.inr_coords = null; }
+    if (!keepState && simState.inr) { disposeInr(simState.inr); simState.inr = null; }
     if (simState.model) simState.model.dispose();
 
     // Update CONFIG from GUI
@@ -1390,9 +1537,16 @@ async function initializeSimulation(keepState = false, oldGrid, oldWallGrid, old
     } else {
         if (oldSunBase) oldSunBase.dispose();
         if (oldSunParams) oldSunParams.dispose();
-        const { sun_base, sun_params } = createSunUpdate(CONFIG);
+        const { sun_base, sun_params, inr } = createSunUpdate(CONFIG);
         simState.sun_base = sun_base;
         simState.sun_params = sun_params;
+        simState.inr = inr;
+    }
+    // Always (re)build the coords cache when in seasonal mode — its shape
+    // depends on GRID_H/W, so a resize makes it stale.
+    if (GUI_STATE.SUN_MODE === 'seasonal') {
+        if (!simState.inr) simState.inr = createInrParams(CONFIG);
+        simState.inr_coords = buildCoordsCache(CONFIG.GRID_H, CONFIG.GRID_W);
     }
     simState.optimizer = createOptimizer();
 
@@ -1464,7 +1618,8 @@ async function initializeSimulation(keepState = false, oldGrid, oldWallGrid, old
     updateGridBorder();
 
     // Sync sun heatmap visibility
-    updateSunHeatmapVisibility(GUI_STATE.USE_LOCAL_SUN);
+    updateSunHeatmapVisibility(GUI_STATE.SUN_MODE !== 'global');
+    updateSeasonalPanelVisibility(GUI_STATE.SUN_MODE === 'seasonal');
 
     // The first simulation step after a config change will be slow (~5-10s)
     // due to WebGL shader compilation. trainStep() yields between its inference
@@ -1667,39 +1822,163 @@ function createRenderShader() {
 
 /**
  * Toggles between global and per-cell (local) sun parameters.
- * Global→Local: tiles the current global sun to every grid cell.
- * Local→Global: averages local sun values back to a single vector.
+ * Switches sun mode across three tiers: 'global' | 'spatial' | 'seasonal'.
+ *
+ * global ↔ spatial : tile / spatial mean (lossless up, lossless-to-mean down).
+ * spatial ↔ seasonal: INR replaces the sun entirely when seasonal. Promotion
+ *   seeds INR output bias with the current sun's spatial mean (spatial
+ *   variation is lost; INR re-learns it). Demotion freezes the INR's current
+ *   spatial output as the new sun_base; sun_params starts at zero.
+ * global ↔ seasonal : composed via spatial.
  */
-function toggleLocalSun(useLocal) {
-    const oldBase = simState.sun_base;
-    const oldParams = simState.sun_params;
+function setSunMode(newMode) {
+    const oldMode = (simState.inr) ? 'seasonal'
+        : (simState.sun_base.shape[1] > 1 ? 'spatial' : 'global');
+    if (newMode === oldMode) return;
 
-    if (useLocal) {
-        // Global [1,1,1,CWA] → Local [1,H,W,CWA]: tile base, reset params to zero
-        const H = CONFIG.GRID_H, W = CONFIG.GRID_W;
-        const CWA = oldBase.shape[3];
-        simState.sun_base = tf.keep(
-            oldBase.tile([1, H, W, 1])
-        );
+    const H = CONFIG.GRID_H, W = CONFIG.GRID_W;
+    const CWA = simState.sun_base.shape[simState.sun_base.shape.length - 1];
+
+    const promoteGlobalToSpatial = () => {
+        const oldBase = simState.sun_base, oldParams = simState.sun_params;
+        simState.sun_base = tf.keep(oldBase.tile([1, H, W, 1]));
         simState.sun_params = tf.keep(tf.variable(tf.zeros([1, H, W, CWA]), true));
-    } else {
-        // Local [1,H,W,CWA] → Global [1,1,1,CWA]: mean-reduce to recover a single vector
-        simState.sun_base = tf.keep(
-            oldBase.mean([1, 2], true)
-        );
+        oldBase.dispose(); oldParams.dispose();
+    };
+
+    const demoteSpatialToGlobal = () => {
+        const oldBase = simState.sun_base, oldParams = simState.sun_params;
+        simState.sun_base = tf.keep(oldBase.mean([1, 2], true));
         const paramsMean = oldParams.mean([1, 2], true);
         simState.sun_params = tf.keep(tf.variable(paramsMean, true));
         paramsMean.dispose();
-    }
+        oldBase.dispose(); oldParams.dispose();
+    };
 
-    oldBase.dispose();
-    oldParams.dispose();
-    console.log(`Sun mode: ${useLocal ? 'local' : 'global'}, sun_params shape: ${simState.sun_params.shape}`);
+    // Seeds the INR's output bias with the spatial mean of (sun_base + sun_params)
+    // so at t=0 the sun is a spatially-uniform approximation of the previous state.
+    const promoteSpatialToSeasonal = () => {
+        simState.inr = createInrParams(CONFIG);
+        if (simState.inr_coords) simState.inr_coords.dispose();
+        simState.inr_coords = buildCoordsCache(H, W);
+        tf.tidy(() => {
+            const sum = simState.sun_base.add(simState.sun_params);
+            const mu = sum.mean([1, 2]).reshape([CWA]);
+            simState.inr.inr_bout.assign(mu);
+        });
+    };
+
+    // Freezes the INR's current output as the new sun_base; sun_params starts at zero.
+    const demoteSeasonalToSpatial = () => {
+        if (simState.inr && simState.inr_coords) {
+            const inr_out = evaluateInr(simState.inr, simState.inr_coords, CONFIG);
+            const oldBase = simState.sun_base, oldParams = simState.sun_params;
+            simState.sun_base = tf.keep(inr_out.clone());
+            simState.sun_params = tf.keep(tf.variable(tf.zeros([1, H, W, CWA]), true));
+            oldBase.dispose();
+            oldParams.dispose();
+            inr_out.dispose();
+        }
+        disposeInr(simState.inr);
+        simState.inr = null;
+        if (simState.inr_coords) { simState.inr_coords.dispose(); simState.inr_coords = null; }
+    };
+
+    if (oldMode === 'global' && newMode === 'spatial') {
+        promoteGlobalToSpatial();
+    } else if (oldMode === 'spatial' && newMode === 'global') {
+        demoteSpatialToGlobal();
+    } else if (oldMode === 'spatial' && newMode === 'seasonal') {
+        promoteSpatialToSeasonal();
+    } else if (oldMode === 'seasonal' && newMode === 'spatial') {
+        demoteSeasonalToSpatial();
+    } else if (oldMode === 'global' && newMode === 'seasonal') {
+        promoteGlobalToSpatial();
+        promoteSpatialToSeasonal();
+    } else if (oldMode === 'seasonal' && newMode === 'global') {
+        demoteSeasonalToSpatial();
+        demoteSpatialToGlobal();
+    }
+    console.log(`Sun mode: ${oldMode} → ${newMode}, sun_params shape: ${simState.sun_params.shape}`);
 }
 
 function updateSunHeatmapVisibility(visible) {
     const li = document.getElementById('sun-heatmap-li');
     if (li) li.style.display = visible ? 'block' : 'none';
+    const rateLi = document.getElementById('sun-heatmap-rate-li');
+    if (rateLi) rateLi.style.display = visible ? 'block' : 'none';
+    const blendLi = document.getElementById('sun-overlay-blend-li');
+    if (blendLi) blendLi.style.display = visible ? 'block' : 'none';
+    if (!visible) hideSunOverlay();
+}
+
+function updateSeasonalPanelVisibility(visible) {
+    const li = document.getElementById('sun-seasonal-li');
+    if (li) li.style.display = visible ? 'block' : 'none';
+}
+
+let _seasonalPanelPending = false;
+function updateSeasonalPanel() {
+    if (_seasonalPanelPending) return;
+    if (GUI_STATE.SUN_MODE !== 'seasonal' || !simState.inr) return;
+    _seasonalPanelPending = true;
+    getInrPeriods(simState.inr).then(periods => {
+        _seasonalPanelPending = false;
+        const el = document.getElementById('sun-seasonal-periods');
+        if (!el) return;
+        const fmt = v => v < 100 ? v.toFixed(1) : v < 10000 ? Math.round(v).toString() : v.toExponential(1);
+        const lines = periods.map((p, i) => `S${i + 1}: ${fmt(p).padStart(7)}`);
+        el.textContent = lines.join('\n');
+    }).catch(() => { _seasonalPanelPending = false; });
+}
+
+function positionSunOverlay(centerX, centerY, w, h) {
+    const overlay = document.getElementById('sun-overlay-canvas');
+    if (!overlay) return;
+    if (centerX === undefined) {
+        const canvas = document.getElementById('c');
+        const r = canvas.getBoundingClientRect();
+        const canvasAspect = r.width / r.height;
+        const gridAspect = CONFIG.GRID_W / CONFIG.GRID_H;
+        if (canvasAspect > gridAspect) { h = r.height; w = h * gridAspect; }
+        else { w = r.width; h = w / gridAspect; }
+        centerX = r.left + r.width / 2;
+        centerY = r.top + r.height / 2;
+    }
+    overlay.style.left = `${centerX}px`;
+    overlay.style.top = `${centerY}px`;
+    overlay.style.width = `${w}px`;
+    overlay.style.height = `${h}px`;
+}
+
+function renderSunOverlay() {
+    const src = document.getElementById('sun-heatmap-canvas');
+    const overlay = document.getElementById('sun-overlay-canvas');
+    if (!src || !overlay || !src.width || !src.height) return;
+    // Source canvas is W x (H + KEY_H + 2). The heatmap proper occupies the top H rows.
+    const W = src.width;
+    const H = CONFIG.GRID_H;
+    if (overlay.width !== W || overlay.height !== H) {
+        overlay.width = W;
+        overlay.height = H;
+    }
+    const ctx = overlay.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(src, 0, 0, W, H, 0, 0, W, H);
+}
+
+function showSunOverlay() {
+    const overlay = document.getElementById('sun-overlay-canvas');
+    if (!overlay) return;
+    positionSunOverlay();
+    renderSunOverlay();
+    overlay.style.display = 'block';
+}
+
+function hideSunOverlay() {
+    const overlay = document.getElementById('sun-overlay-canvas');
+    if (overlay) overlay.style.display = 'none';
 }
 
 // Guard to prevent overlapping heatmap updates (async)
@@ -1712,23 +1991,26 @@ let _sunHeatmapPending = false;
  */
 function updateSunHeatmap() {
     if (_sunHeatmapPending) return;
-    if (!GUI_STATE.USE_LOCAL_SUN || !simState.sun_params || simState.sun_params.shape[1] <= 1) return;
+    if (GUI_STATE.SUN_MODE === 'global' || !simState.sun_params || simState.sun_params.shape[1] <= 1) return;
 
     const canvas = document.getElementById('sun-heatmap-canvas');
     const statsEl = document.getElementById('sun-heatmap-stats');
     if (!canvas) return;
 
     // Compute divergence on GPU, excluding wall cells from the mean.
-    // Returns {div: [H,W], wallMask: [H,W]} — wall cells get zero divergence.
+    // In seasonal mode, read the INR's current spatial output. Otherwise,
+    // read sun_params directly.
     const { divTensor, wallTensor } = tf.tidy(() => {
-        const params = simState.sun_params;                     // [1, H, W, CWA]
+        const isSeasonal = (GUI_STATE.SUN_MODE === 'seasonal') && simState.inr && simState.inr_coords;
+        const field = isSeasonal
+            ? evaluateInr(simState.inr, simState.inr_coords, CONFIG)   // [1,H,W,CWA]
+            : simState.sun_params;                                      // [1,H,W,CWA]
         const walls = simState.wallGrid;                        // [1, H, W, 1]
         const nonWall = walls.less(0.5).cast('float32');        // 1 = open, 0 = wall
-        // Mean over non-wall cells only
-        const nonWallCount = nonWall.sum().maximum(1);          // avoid div-by-zero
-        const maskedParams = params.mul(nonWall);               // zero out walls
-        const mean = maskedParams.sum([1, 2], true).div(nonWallCount); // [1,1,1,CWA]
-        const diff = params.sub(mean).mul(nonWall);             // zero diff at walls
+        const nonWallCount = nonWall.sum().maximum(1);
+        const maskedField = field.mul(nonWall);
+        const mean = maskedField.sum([1, 2], true).div(nonWallCount);
+        const diff = field.sub(mean).mul(nonWall);
         const div = diff.square().sum(-1).sqrt().squeeze([0]);  // [H, W]
         const wm = walls.squeeze([0, 3]);                       // [H, W]
         return { divTensor: div, wallTensor: wm };
@@ -1821,6 +2103,10 @@ function updateSunHeatmap() {
             const fmt = v => v === 0 ? '0' : v < 0.001 ? v.toExponential(1) : v.toFixed(4);
             statsEl.textContent = `mean: ${fmt(meanD)}  max: ${fmt(maxDist)}`;
         }
+
+        // If the overlay is currently visible, refresh it with the new heatmap frame.
+        const overlay = document.getElementById('sun-overlay-canvas');
+        if (overlay && overlay.style.display === 'block') renderSunOverlay();
     }).catch(() => { _sunHeatmapPending = false; });
 }
 
@@ -1871,6 +2157,8 @@ function updateGridBorder() {
     border.style.top = `${centerY}px`;
     border.style.width = `${w}px`;
     border.style.height = `${h}px`;
+
+    positionSunOverlay(centerX, centerY, w, h);
 }
 
 // =============================================================================
@@ -1896,8 +2184,9 @@ async function simulationLoop() {
         }
         if (LOG_PERFORMANCE) t0 = performance.now();
         const result = tf.tidy(() =>
-            simulationStep(simState.grid, simState.model, simState.sun_base, simState.sun_params, simState.wallGrid, CONFIG, simState.localWinRate)
+            simulationStep(simState.grid, simState.model, simState.sun_base, simState.sun_params, simState.wallGrid, CONFIG, simState.localWinRate, simState.inr, simState.inr_coords)
         );
+        stepInrPhase(simState.inr);
         if (LOG_PERFORMANCE) {
             t1 = performance.now();
             console.log(`[PERF] Inference: ${(t1 - t0).toFixed(2)} ms`);
@@ -1934,8 +2223,11 @@ async function simulationLoop() {
             if (LOG_PERFORMANCE) t0 = performance.now();
             const { newGrid, loss } = await trainStep(
                 simState.grid, simState.model, simState.sun_base, simState.sun_params,
-                simState.wallGrid, simState.optimizer, CONFIG, progressCb
+                simState.wallGrid, simState.optimizer, CONFIG, progressCb,
+                simState.inr, simState.inr_coords
             );
+            // Advance INR phase accumulator outside the gradient tape.
+            stepInrPhase(simState.inr);
             if (LOG_PERFORMANCE) {
                 t1 = performance.now();
                 console.log(`[PERF] Training: ${(t1 - t0).toFixed(2)} ms, Loss: ${loss.toFixed(4)}`);
@@ -1948,8 +2240,9 @@ async function simulationLoop() {
         } else {
             if (LOG_PERFORMANCE) t0 = performance.now();
             const result = tf.tidy(() =>
-                simulationStep(simState.grid, simState.model, simState.sun_base, simState.sun_params, simState.wallGrid, CONFIG, simState.localWinRate)
+                simulationStep(simState.grid, simState.model, simState.sun_base, simState.sun_params, simState.wallGrid, CONFIG, simState.localWinRate, simState.inr, simState.inr_coords)
             );
+            stepInrPhase(simState.inr);
             if (LOG_PERFORMANCE) {
                 t1 = performance.now();
                 console.log(`[PERF] Sim step: ${(t1 - t0).toFixed(2)} ms`);
@@ -1993,9 +2286,14 @@ async function simulationLoop() {
     if (simState.globalStep % 2 === 0) { // Every 2 steps to reduce overhead
         collectMetrics();
     }
-    // Update sun divergence heatmap every 50 steps when local sun is active
-    if (GUI_STATE.USE_LOCAL_SUN && simState.globalStep % 50 === 0) {
+    // Update sun divergence heatmap at user-configured cadence when sun is non-global
+    const heatmapEvery = Math.max(1, GUI_STATE.HEATMAP_UPDATE_EVERY | 0);
+    if (GUI_STATE.USE_LOCAL_SUN && simState.globalStep % heatmapEvery === 0) {
         updateSunHeatmap();
+    }
+    // Update seasonal periods read-out every 30 steps when seasonal mode is active
+    if (GUI_STATE.SUN_MODE === 'seasonal' && simState.globalStep % 30 === 0) {
+        updateSeasonalPanel();
     }
     // Auto-checkpoint every 500 steps
     if (runManager.shouldAutoSave()) {
@@ -2637,7 +2935,8 @@ async function loadCheckpointData(checkpoint) {
     updateGridBorder();
 
     // Sync sun heatmap visibility with restored state
-    updateSunHeatmapVisibility(GUI_STATE.USE_LOCAL_SUN);
+    updateSunHeatmapVisibility(GUI_STATE.SUN_MODE !== 'global');
+    updateSeasonalPanelVisibility(GUI_STATE.SUN_MODE === 'seasonal');
 
     // Force timeline redraw immediately
     if (timelineDashboard) {

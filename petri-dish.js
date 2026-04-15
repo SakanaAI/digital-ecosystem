@@ -161,8 +161,15 @@ const GUI_STATE = {
     // Color scheme for species
     COLOR_SCHEME: 'Vibrant',
 
-    // Local sun: per-cell learnable sun parameters (false = single global sun)
-    USE_LOCAL_SUN: false,
+    // Sun mode: 'global' (single vector), 'spatial' (per-cell learnable),
+    // 'seasonal' (time-conditioned INR with learnable Fourier features).
+    SUN_MODE: 'global',
+    // How often (in sim steps) to refresh the sun divergence heatmap.
+    HEATMAP_UPDATE_EVERY: 50,
+    // Back-compat: read-through derived from SUN_MODE. Some code paths still
+    // treat "local sun" as "anything spatially varying" (spatial OR seasonal).
+    get USE_LOCAL_SUN() { return this.SUN_MODE !== 'global'; },
+    set USE_LOCAL_SUN(v) { this.SUN_MODE = v ? 'spatial' : 'global'; },
 
     // Show FPS counter
     SHOW_FPS: false,
@@ -455,9 +462,11 @@ function createGrid(config) {
 
 /**
  * Creates the sun's update vector with trainable parameters.
+ * Returns { sun_base, sun_params, inr } where inr is non-null only in seasonal mode.
  */
 function createSunUpdate(config) {
-    return tf.tidy(() => {
+    const mode = GUI_STATE.SUN_MODE;
+    const { sun_base, sun_params } = tf.tidy(() => {
         const { CELL_WO_ALIVE_DIM, CELL_STATE_DIM, CELL_HIDDEN_DIM } = config;
         let sun_vec = tf.randomNormal([CELL_WO_ALIVE_DIM]).mul(config.SUN_INIT_SCALE);
 
@@ -474,10 +483,8 @@ function createSunUpdate(config) {
         sun_vec = sun_vec.div(sun_vec.norm().add(EPSILON));
 
         // Sun tensors are stored as 4D to avoid TF.js WebGL 5D shader issues.
-        // Global: [1, 1, 1, CWA], Local: [1, H, W, CWA].
-        // Expanded to 5D only at the concat point in simulationStep.
-        if (GUI_STATE.USE_LOCAL_SUN) {
-            // Per-cell sun: tile the base vector to every grid location
+        // Global: [1, 1, 1, CWA], Spatial/Seasonal: [1, H, W, CWA].
+        if (mode !== 'global') {
             const H = config.GRID_H, W = config.GRID_W;
             const sun_base = tf.keep(
                 sun_vec.reshape([1, 1, 1, CELL_WO_ALIVE_DIM]).tile([1, H, W, 1])
@@ -485,12 +492,194 @@ function createSunUpdate(config) {
             const sun_params = tf.keep(tf.variable(tf.zeros([1, H, W, CELL_WO_ALIVE_DIM]), true));
             return { sun_base, sun_params };
         } else {
-            // Global sun: single vector broadcast to all cells
             const sun_base = tf.keep(sun_vec.reshape([1, 1, 1, CELL_WO_ALIVE_DIM]));
             const sun_params = tf.keep(tf.variable(tf.zeros([1, 1, 1, CELL_WO_ALIVE_DIM]), true));
             return { sun_base, sun_params };
         }
     });
+    const inr = (mode === 'seasonal') ? createInrParams(config) : null;
+    return { sun_base, sun_params, inr };
+}
+
+// =============================================================================
+// SEASONAL SUN — INR(x, y, t) with learnable time periods
+// =============================================================================
+//
+// In seasonal mode the INR FULLY replaces sun_base+sun_params:
+//   sun(x,y,t) = tanh( INR(x,y,t) )
+//
+// INR = MLP( [γ_xy(x,y), γ_t(t)] )
+//   γ_xy uses Learnable Fourier Features (Li et al., NeurIPS 2021):
+//     γ_xy = (1/√(D/2)) · [cos(p·W_r), sin(p·W_r)] with W_r ∈ R^{2×D/2} trainable.
+//   γ_t uses K_T=8 *learnable* log_period values. Phase is maintained as a
+//   non-trainable accumulator variable so ∂phase/∂log_period = O(1) rather
+//   than O(t) — i.e., gradients stay bounded no matter how long the sim runs.
+//
+// MLP: 40 → 32 → 32 → CWA, ReLU hidden, linear output.
+// The output layer is ZERO-initialized so Spatial→Seasonal promotion is
+// bit-identical at the step of promotion (lossless) up to the bout reseed.
+//
+// Training: INR params live in their own var list and are updated via manual
+// SGD scaled by SUN_LR_SCALE (same pattern as sun_params). This keeps the
+// slider semantics "0 = fully frozen sun" exact.
+
+const INR_GAMMA_XY_DIM = 24;           // output dim D of the LFF block
+const INR_LFF_SIGMA = 5.0;             // init stddev of W_r — coords in [-1,1]
+const INR_K_T  = 8;                    // temporal Fourier bands (learnable periods)
+const INR_GAMMA_T_DIM  = 2 * INR_K_T;  // 16
+const INR_INPUT_DIM = INR_GAMMA_XY_DIM + INR_GAMMA_T_DIM; // 40
+const INR_HIDDEN = 32;
+const INR_LOG_PERIOD_MIN = Math.log(25);
+const INR_LOG_PERIOD_MAX = Math.log(10000);
+
+/**
+ * Heuristic Xavier-like init for a Dense layer.
+ */
+function _inrInitDense(inDim, outDim, scale = 1.0) {
+    const limit = scale * Math.sqrt(6 / (inDim + outDim));
+    return tf.keep(tf.variable(tf.randomUniform([inDim, outDim], -limit, limit), true));
+}
+
+/**
+ * Allocates INR parameters (MLP + learnable periods + phase accumulator).
+ * Final linear layer is zero-initialized so INR(x,y,t) ≡ 0 at promotion.
+ */
+function createInrParams(config) {
+    const CWA = config.CELL_WO_ALIVE_DIM;
+
+    // Learnable log-period, initialized log-uniform over [25, 1000] sim steps.
+    const logPeriodInit = new Float32Array(INR_K_T);
+    const lo = Math.log(25), hi = Math.log(1000);
+    for (let k = 0; k < INR_K_T; k++) {
+        logPeriodInit[k] = lo + (hi - lo) * (k / Math.max(1, INR_K_T - 1));
+    }
+    const inr_log_period = tf.keep(tf.variable(tf.tensor1d(logPeriodInit), true));
+    // Phase accumulator — updated each sim step outside the tape, and
+    // excluded from the optimizer varList (so effectively non-trainable).
+    const inr_phase = tf.keep(tf.variable(tf.zeros([INR_K_T]), true));
+
+    // Spatial LFF projection: W_r ∈ R^{2 × D/2}, init N(0, σ²).
+    const inr_W_r = tf.keep(tf.variable(
+        tf.randomNormal([2, INR_GAMMA_XY_DIM / 2], 0, INR_LFF_SIGMA), true
+    ));
+
+    // First layer split into spatial and temporal branches (algebraic identity:
+    // [γ_xy; γ_t] @ W1 = γ_xy @ W1_xy + γ_t @ W1_t). Avoids tile+concat over
+    // [1,H,W,40] textures each step.
+    const inr_W1_xy = _inrInitDense(INR_GAMMA_XY_DIM, INR_HIDDEN);
+    const inr_W1_t  = _inrInitDense(INR_GAMMA_T_DIM,  INR_HIDDEN);
+    const inr_b1 = tf.keep(tf.variable(tf.zeros([INR_HIDDEN]), true));
+    const inr_W2 = _inrInitDense(INR_HIDDEN, INR_HIDDEN);
+    const inr_b2 = tf.keep(tf.variable(tf.zeros([INR_HIDDEN]), true));
+    // Output layer zero-init; bout may be reassigned at promotion time to the
+    // spatial mean of the previous sun (see setSunMode promote path).
+    const inr_Wout = tf.keep(tf.variable(tf.zeros([INR_HIDDEN, CWA]), true));
+    const inr_bout = tf.keep(tf.variable(tf.zeros([CWA]), true));
+
+    return {
+        inr_log_period, inr_phase,
+        inr_W_r,
+        inr_W1_xy, inr_W1_t,
+        inr_b1, inr_W2, inr_b2, inr_Wout, inr_bout,
+    };
+}
+
+function disposeInr(inr) {
+    if (!inr) return;
+    for (const k of Object.keys(inr)) {
+        if (inr[k] && !inr[k].isDisposed) inr[k].dispose();
+    }
+}
+
+/**
+ * List the trainable INR variables (for inclusion in optimizer var list).
+ * Excludes inr_phase, which is maintained outside the tape as a side-effect.
+ */
+function inrTrainableVars(inr) {
+    if (!inr) return [];
+    return [
+        inr.inr_log_period,
+        inr.inr_W_r,
+        inr.inr_W1_xy, inr.inr_W1_t, inr.inr_b1,
+        inr.inr_W2, inr.inr_b2,
+        inr.inr_Wout, inr.inr_bout,
+    ];
+}
+
+/**
+ * Build the normalized coordinate grid ∈ [1, H, W, 2] with x,y ∈ [-1, 1].
+ */
+function buildCoordsCache(H, W) {
+    return tf.tidy(() => {
+        const xs = tf.linspace(-1, 1, W).reshape([1, 1, W, 1]).tile([1, H, 1, 1]);
+        const ys = tf.linspace(-1, 1, H).reshape([1, H, 1, 1]).tile([1, 1, W, 1]);
+        return tf.keep(tf.concat([xs, ys], 3)); // [1, H, W, 2]
+    });
+}
+
+/**
+ * Update the phase accumulator in place: phase ← (phase + 2π·exp(-log_period)) mod 2π.
+ * Runs outside the gradient tape so ∂phase/∂log_period stays bounded across long sims.
+ */
+function stepInrPhase(inr, dt = 1) {
+    if (!inr) return;
+    tf.tidy(() => {
+        const TWO_PI = 2 * Math.PI;
+        const omega = tf.exp(inr.inr_log_period.neg()).mul(TWO_PI * dt);
+        const newPhase = inr.inr_phase.add(omega);
+        const wrapped = newPhase.sub(newPhase.div(TWO_PI).floor().mul(TWO_PI));
+        inr.inr_phase.assign(wrapped);
+    });
+}
+
+/**
+ * Evaluate the INR MLP on the full grid. Returns [1, H, W, CWA].
+ * coords: [1, H, W, 2] — normalized (x, y) grid cache.
+ *
+ * Phase is a stop-gradient accumulator: the tape sees phase as a constant
+ * plus the current-step `omega·dt` increment (dt=1), bounding period grads.
+ */
+function evaluateInr(inr, coords, config) {
+    const H = coords.shape[1], W = coords.shape[2];
+    const N = H * W;
+    const CWA = config.CELL_WO_ALIVE_DIM;
+    const D2 = INR_GAMMA_XY_DIM / 2; // 12
+    const INV_SQRT_D2 = 1 / Math.sqrt(D2);
+    return tf.tidy(() => {
+        const omega = tf.exp(inr.inr_log_period.neg()).mul(2 * Math.PI);
+        const phase_eff = inr.inr_phase.add(omega); // dt=1
+        const gamma_t_1d = tf.concat(
+            [tf.sin(phase_eff), tf.cos(phase_eff)], 0
+        ).reshape([1, INR_GAMMA_T_DIM]); // [1, 16]
+
+        const coords_flat = coords.reshape([N, 2]);                       // [N, 2]
+        const proj = tf.matMul(coords_flat, inr.inr_W_r);                  // [N, 12]
+        const gamma_xy_flat = tf.concat(
+            [tf.cos(proj), tf.sin(proj)], 1
+        ).mul(INV_SQRT_D2);                                                // [N, 24]
+
+        const preact_xy = tf.matMul(gamma_xy_flat, inr.inr_W1_xy);          // [N, HIDDEN]
+        const preact_t  = tf.matMul(gamma_t_1d,    inr.inr_W1_t);            // [1, HIDDEN]
+        const h1 = tf.relu(preact_xy.add(preact_t).add(inr.inr_b1));         // [N, HIDDEN]
+
+        const h2 = tf.fused.matMul({
+            a: h1, b: inr.inr_W2, bias: inr.inr_b2, activation: 'relu'
+        });
+        const out = tf.fused.matMul({
+            a: h2, b: inr.inr_Wout, bias: inr.inr_bout
+        }); // [N, CWA]
+
+        return out.reshape([1, H, W, CWA]);
+    });
+}
+
+/**
+ * Read the learned periods as a JS number array (for UI display).
+ */
+async function getInrPeriods(inr) {
+    if (!inr) return [];
+    const data = await inr.inr_log_period.data();
+    return Array.from(data, v => Math.exp(v));
 }
 
 // =============================================================================
@@ -1068,7 +1257,7 @@ function runCompetition(grid, all_updates, wallGrid, config) {
  * @param {tf.Tensor} localWinRate - Optional per-cell running win rate [1, H, W, 1]
  * @returns {Object} { grid, localWinRate } if localWinRate provided, otherwise just grid
  */
-function simulationStep(grid, model, sun_base, sun_params, wallGrid, config, localWinRate = null) {
+function simulationStep(grid, model, sun_base, sun_params, wallGrid, config, localWinRate = null, inr = null, coords = null, inr_out_override = null) {
     return tf.tidy(() => {
         perfStart('sim-step-total');
         const { N_NCAS, CELL_WO_ALIVE_DIM, ALIVE_DIM, ALIVE_VISIBLE } = config;
@@ -1088,8 +1277,19 @@ function simulationStep(grid, model, sun_base, sun_params, wallGrid, config, loc
 
         // Sun update — sun tensors are 4D [1,H,W,CWA] or [1,1,1,CWA]; compute
         // in 4D (avoiding TF.js WebGL 5D shader bugs) then expand for concat.
+        // In seasonal mode, the INR FULLY describes the sun (no base+params add).
+        // Callers may pass `inr_out_override` to short-circuit the MLP forward
+        // (used by trainStep to reuse a precomputed full-grid inference output).
         perfStart('sim-sun-update');
-        const sun_update_4d = sun_base.add(sun_params).tanh(); // 4D
+        let sun_pre;
+        if (inr && (coords || inr_out_override)) {
+            sun_pre = inr_out_override
+                ? inr_out_override
+                : evaluateInr(inr, coords, config);
+        } else {
+            sun_pre = sun_base.add(sun_params);
+        }
+        const sun_update_4d = sun_pre.tanh(); // 4D
         // Broadcast global sun to spatial dims if needed
         const sun_spatial = (sun_update_4d.shape[1] === 1)
             ? sun_update_4d.mul(tf.ones([1, h, w, 1], 'float32'))
@@ -1351,7 +1551,7 @@ function getLastTrainingLoss() {
  * stored in _lastTrainingLoss and updated when the GPU finishes. This prevents
  * the ~125ms GPU sync stall from blocking the main thread.
  */
-async function trainStep(grid, model, sun_base, sun_params, wallGrid, optimizer, config, onProgress) {
+async function trainStep(grid, model, sun_base, sun_params, wallGrid, optimizer, config, onProgress, inr = null, coords = null) {
     perfStart('train-step-total');
 
     // ONE-STEP LAG: Run inference on full grid FIRST (before weight update)
@@ -1365,9 +1565,18 @@ async function trainStep(grid, model, sun_base, sun_params, wallGrid, optimizer,
         onProgress('Forward pass → model predict + competition + stochastic update');
         await new Promise(r => setTimeout(r, 0));
     }
+    // If the INR is frozen (SUN_LR_SCALE=0), its gradient path is wasted work.
+    // Pre-compute its full-grid output ONCE and feed it as a detached constant
+    // to both the inference pass and the loss closure.
+    const sunFrozen = (GUI_STATE.SUN_LR_SCALE === 0);
+    let inr_out_full = null;
+    if (inr && coords && sunFrozen) {
+        inr_out_full = tf.keep(evaluateInr(inr, coords, config));
+    }
+
     perfStart('train-inference');
     let newGrid = tf.tidy(() =>
-        simulationStep(grid, model, sun_base, sun_params, wallGrid, config)
+        simulationStep(grid, model, sun_base, sun_params, wallGrid, config, null, inr, coords, inr_out_full)
     );
     perfEnd('train-inference');
 
@@ -1387,16 +1596,33 @@ async function trainStep(grid, model, sun_base, sun_params, wallGrid, optimizer,
         // TF.js tape records the slice; gradient back-propagates as a pad with zeros.
         let sun_base_eff = sun_base;
         let sun_params_eff = sun_params;
+        let coords_eff = coords;
+        let inr_out_eff = null;
         if (isLocalSun) {
             sun_base_eff = sun_base.slice([0, startY, startX, 0], [1, patchH, patchW, -1]);
             sun_params_eff = sun_params.slice([0, startY, startX, 0], [1, patchH, patchW, -1]);
+            if (coords) {
+                coords_eff = coords.slice([0, startY, startX, 0], [1, patchH, patchW, -1]);
+            }
+            if (inr_out_full) {
+                inr_out_eff = inr_out_full.slice([0, startY, startX, 0], [1, patchH, patchW, -1]);
+            }
+        } else if (inr_out_full) {
+            inr_out_eff = inr_out_full;
         }
-        const next_grid = simulationStep(currentGrid, model, sun_base_eff, sun_params_eff, wallGridSample, config);
+        const next_grid = simulationStep(
+            currentGrid, model, sun_base_eff, sun_params_eff, wallGridSample, config, null,
+            inr, coords_eff, inr_out_eff
+        );
         return computeLoss(next_grid, config);
     });
 
     const modelVars = model.trainableWeights.map(w => w.val);
-    const varList = modelVars.concat([sun_params]);
+    // When INR is frozen we feed its output as a detached constant, so none of
+    // the INR vars participate in the tape. Excluding them from the varList
+    // avoids computeGradients attempting to trace dead paths.
+    const inrVars = sunFrozen ? [] : inrTrainableVars(inr);
+    const varList = modelVars.concat([sun_params]).concat(inrVars);
 
     const { value, grads } = optimizer.computeGradients(() => lossFunction(optimizationGrid), varList);
     perfEnd('train-gradient');
@@ -1413,16 +1639,43 @@ async function trainStep(grid, model, sun_base, sun_params, wallGrid, optimizer,
     const sunGrad = grads[sunGradName];
     delete grads[sunGradName];
 
+    // Strip INR gradients from the main optimizer's dict — same manual-SGD
+    // pattern as sun_params so SUN_LR_SCALE=0 is a true hard freeze of the
+    // entire INR (no Adam moments to leak through).
+    const inrGradEntries = [];
+    for (const v of inrVars) {
+        const g = grads[v.name];
+        if (g !== undefined) {
+            inrGradEntries.push({ v, g });
+            delete grads[v.name];
+        }
+    }
+
     optimizer.applyGradients(grads);
 
     const sunScale = GUI_STATE.SUN_LR_SCALE;
+    const lr = GUI_STATE.LEARNING_RATE;
     if (sunScale > 0 && sunGrad) {
         tf.tidy(() => {
-            const lr = GUI_STATE.LEARNING_RATE;
             sun_params.assign(sun_params.sub(sunGrad.mul(lr * sunScale)));
         });
     }
     if (sunGrad) sunGrad.dispose();
+
+    if (sunScale > 0 && inrGradEntries.length > 0) {
+        tf.tidy(() => {
+            for (const { v, g } of inrGradEntries) {
+                v.assign(v.sub(g.mul(lr * sunScale)));
+            }
+            if (inr) {
+                // Clamp log_period to prevent drift to degenerate frequencies.
+                inr.inr_log_period.assign(
+                    inr.inr_log_period.clipByValue(INR_LOG_PERIOD_MIN, INR_LOG_PERIOD_MAX)
+                );
+            }
+        });
+    }
+    for (const { g } of inrGradEntries) g.dispose();
     perfEnd('train-apply-grads');
 
     // NON-BLOCKING: Fire off async loss retrieval, don't wait for GPU sync
@@ -1439,6 +1692,7 @@ async function trainStep(grid, model, sun_base, sun_params, wallGrid, optimizer,
     // Cleanup subsampled grids
     optimizationGrid.dispose();
     wallGridSample.dispose();
+    if (inr_out_full) inr_out_full.dispose();
 
     perfEnd('train-step-total');
     return { newGrid, loss: _lastTrainingLoss };  // Return last known loss (may be from previous step)
@@ -1823,12 +2077,10 @@ async function serializeGridState(simStateObj) {
         simStateObj.sun_params.data(),
     ]);
 
-    // Copy only the typed array's portion of the buffer (not the full underlying ArrayBuffer,
-    // which may be larger if the typed array is a view into shared memory)
     const copyBuffer = (typedArray) =>
         typedArray.buffer.slice(typedArray.byteOffset, typedArray.byteOffset + typedArray.byteLength);
 
-    return {
+    const out = {
         grid: copyBuffer(gridData),
         gridShape: simStateObj.grid.shape.slice(),
         wall: copyBuffer(wallData),
@@ -1840,6 +2092,22 @@ async function serializeGridState(simStateObj) {
         sunParams: copyBuffer(sunParamsData),
         sunParamsShape: simStateObj.sun_params.shape.slice(),
     };
+
+    // Seasonal sun: serialize every INR tensor's data + shape.
+    if (simStateObj.inr) {
+        const inr = simStateObj.inr;
+        const keys = Object.keys(inr);
+        const datas = await Promise.all(keys.map(k => inr[k].data()));
+        out.inr = {};
+        keys.forEach((k, i) => {
+            out.inr[k] = {
+                data: copyBuffer(datas[i]),
+                shape: inr[k].shape.slice(),
+            };
+        });
+    }
+
+    return out;
 }
 
 /**
@@ -1853,6 +2121,8 @@ function restoreGridState(simStateObj, checkpointData) {
     if (simStateObj.localWinRate) simStateObj.localWinRate.dispose();
     if (simStateObj.sun_base) simStateObj.sun_base.dispose();
     if (simStateObj.sun_params) simStateObj.sun_params.dispose();
+    if (simStateObj.inr) { disposeInr(simStateObj.inr); simStateObj.inr = null; }
+    if (simStateObj.inr_coords) { simStateObj.inr_coords.dispose(); simStateObj.inr_coords = null; }
 
     // Restore grid (validate buffer size matches shape)
     const gridArray = new Float32Array(checkpointData.grid);
@@ -1901,8 +2171,24 @@ function restoreGridState(simStateObj, checkpointData) {
         )
     );
 
-    // Auto-detect local sun mode from checkpoint shape
-    GUI_STATE.USE_LOCAL_SUN = (simStateObj.sun_base.shape[1] > 1);
+    // Restore INR if present
+    if (checkpointData.inr) {
+        simStateObj.inr = createInrParams({ CELL_WO_ALIVE_DIM: simStateObj.sun_base.shape[3] });
+        tf.tidy(() => {
+            for (const k of Object.keys(checkpointData.inr)) {
+                if (!(k in simStateObj.inr)) continue;
+                const { data, shape } = checkpointData.inr[k];
+                const t = tf.tensor(new Float32Array(data), shape);
+                simStateObj.inr[k].assign(t);
+            }
+        });
+        simStateObj.inr_coords = buildCoordsCache(
+            simStateObj.sun_base.shape[1], simStateObj.sun_base.shape[2]
+        );
+        GUI_STATE.SUN_MODE = 'seasonal';
+    } else {
+        GUI_STATE.SUN_MODE = (simStateObj.sun_base.shape[1] > 1) ? 'spatial' : 'global';
+    }
 }
 
 /**
